@@ -1,28 +1,50 @@
 /**
- * EIP-191 hashing and secp256k1 public-key recovery.
+ * EIP-191 hashing and secp256k1 public-key recovery for shack-payment-gateway.
  *
  * EIP-191 personal_sign format:
- *   "\x19Ethereum Signed Message:\n" + len(msg) + msg
- * The Keccak-256 hash of that string is what the signer signs.
+ * ```
+ * "\x19Ethereum Signed Message:\n" + byteLength(msg) + msg
+ * ```
+ * The Keccak-256 hash of that byte string is what the signer signs.
+ * Note: the length prefix uses the **byte** length of the UTF-8 encoding of
+ * the message, not the JavaScript string `.length` (which counts UTF-16 code
+ * units).  For ASCII messages these are identical.
  */
 
 import { secp256k1 } from "@noble/curves/secp256k1";
 import { keccak_256 } from "@noble/hashes/sha3";
 
-/** Returns the 32-byte EIP-191 Keccak-256 digest of message. */
+/**
+ * Returns the 32-byte EIP-191 Keccak-256 digest of `message`.
+ *
+ * The prefix `"\x19Ethereum Signed Message:\n"` followed by the UTF-8
+ * byte-length of the message is prepended before hashing, matching the
+ * `personal_sign` behavior of Ethereum wallets.
+ *
+ * @param message - Arbitrary string to hash.
+ * @returns 32-byte Keccak-256 digest as a `Uint8Array`.
+ */
 export function eip191Hash(message: string): Uint8Array {
-  const prefix = `\x19Ethereum Signed Message:\n${message.length}`;
   const enc = new TextEncoder();
-  const data = new Uint8Array([...enc.encode(prefix), ...enc.encode(message)]);
+  const msgBytes = enc.encode(message);
+  const prefix = `\x19Ethereum Signed Message:\n${msgBytes.length}`;
+  const data = new Uint8Array([...enc.encode(prefix), ...msgBytes]);
   return keccak_256(data);
 }
 
 /**
  * Recover the Ethereum address that produced an EIP-191 signature.
  *
- * signatureHex is a 65-byte hex string (with or without 0x prefix).
- * The last byte is the recovery identifier v (0, 1, 27, 28, or EIP-155).
- * Returns the recovered address as a lowercase "0x..." string.
+ * Performs ECDSA public-key recovery on the secp256k1 curve using the
+ * pre-computed EIP-191 message hash.
+ *
+ * @param messageHash - 32-byte EIP-191 Keccak-256 digest (from {@link eip191Hash}).
+ * @param signatureHex - 65-byte hex string with or without a leading `0x`.
+ *   The last byte is the recovery identifier `v` (accepted: 0, 1, 27, 28, or
+ *   any EIP-155 value ≥ 35).
+ * @returns Recovered address as a lowercase `"0x..."` hex string.
+ * @throws {Error} If the signature is not valid hex, not exactly 65 bytes, has
+ *   an unrecognized `v` byte, or is cryptographically invalid.
  */
 export function recoverEthAddress(
   messageHash: Uint8Array,
@@ -61,8 +83,7 @@ export function recoverEthAddress(
     throw new Error(`Invalid recovery byte v=${vByte}`);
   }
 
-  // @noble/curves expects the 64-byte r+s as a hex string, plus recovery id.
-  const rsBigInt = BigInt("0x" + stripped.slice(0, 128));
+  // @noble/curves expects the 64-byte r+s as a compact hex string, plus recovery id.
   const sig = secp256k1.Signature.fromCompact(stripped.slice(0, 128)).addRecoveryBit(recId);
 
   let pubKey: { toRawBytes(compressed: boolean): Uint8Array };
@@ -83,9 +104,15 @@ export function recoverEthAddress(
 }
 
 /**
- * Validate that addr is a well-formed Ethereum address.
- * Accepts checksummed or lowercase, with or without 0x prefix.
- * Throws on invalid input.
+ * Validate that `addr` is a well-formed Ethereum address.
+ *
+ * Accepts checksummed or lowercase hex, with or without a `0x` prefix.
+ * This is a **format** check only — it does not verify that the address has
+ * been deployed or holds a balance.
+ *
+ * @param addr - Ethereum address string to validate.
+ * @throws {Error} If `addr` is not exactly 40 hex characters (after stripping
+ *   an optional `0x` prefix), or contains non-hex characters.
  */
 export function validateEthAddress(addr: string): void {
   const stripped = addr.startsWith("0x") ? addr.slice(2) : addr;

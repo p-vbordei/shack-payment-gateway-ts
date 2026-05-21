@@ -2,8 +2,14 @@
 /**
  * shack-payment-gateway MCP server.
  *
- * Speaks JSON-RPC 2.0 over stdio. STDOUT carries only protocol messages;
- * all diagnostic output goes to STDERR.
+ * Speaks JSON-RPC 2.0 over stdio (one newline-delimited JSON object per line).
+ * STDOUT carries only protocol messages; all diagnostic output goes to STDERR.
+ *
+ * Authorization flow:
+ * 1. Client calls `request_authorization` to receive a unique EIP-191 challenge.
+ * 2. Client signs the challenge off-server with their Ethereum private key.
+ * 3. Client calls `verify_payment` with the challenge and 65-byte hex signature.
+ * 4. Server recovers the signer address and checks it against `authorizedWallet`.
  */
 
 import * as readline from "readline";
@@ -61,18 +67,31 @@ const TOOLS = [
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 type JsonValue = any;
 
+/** Build a JSON-RPC 2.0 success response. */
 function ok(id: JsonValue, result: JsonValue): object {
   return { jsonrpc: "2.0", result, id };
 }
 
+/** Build a JSON-RPC 2.0 error response. */
 function err(id: JsonValue, code: number, message: string): object {
   return { jsonrpc: "2.0", error: { code, message }, id };
 }
 
+/** Wrap `payload` in the MCP content envelope (a JSON-encoded text block). */
 function textContent(payload: object): object {
   return { content: [{ type: "text", text: JSON.stringify(payload) }] };
 }
 
+/**
+ * Handle the `request_authorization` tool call.
+ *
+ * Generates a globally unique EIP-191 challenge string that the client
+ * must sign with their Ethereum private key.  The challenge embeds the
+ * `tool_name`, `cost`, a Unix timestamp, and a 16-byte random nonce to
+ * prevent replay attacks.
+ *
+ * @throws {Error} On missing, empty, or non-numeric arguments.
+ */
 function handleRequestAuthorization(args: JsonValue): object {
   const toolName: string = args?.tool_name ?? "";
   const cost: string = args?.cost ?? "";
@@ -94,6 +113,17 @@ function handleRequestAuthorization(args: JsonValue): object {
   return textContent({ challenge, tool_name: toolName, cost });
 }
 
+/**
+ * Handle the `verify_payment` tool call.
+ *
+ * Recovers the Ethereum address that signed `challenge` and compares it
+ * against `authorizedWallet`.  In permissive mode (`authorizedWallet === null`)
+ * any valid signature is accepted.
+ *
+ * @returns MCP content envelope with `verified` (boolean),
+ *   `recovered_address`, and `authorized_address`.
+ * @throws {Error} On missing/empty arguments or invalid signature.
+ */
 function handleVerifyPayment(args: JsonValue, authorizedWallet: string | null): object {
   const challenge: string = args?.challenge ?? "";
   const signature: string = args?.signature ?? "";
@@ -123,6 +153,14 @@ function handleVerifyPayment(args: JsonValue, authorizedWallet: string | null): 
   });
 }
 
+/**
+ * Dispatch a tool call by name.
+ *
+ * @param name - Tool name (`"request_authorization"` or `"verify_payment"`).
+ * @param toolArgs - Arguments forwarded to the tool handler.
+ * @param authorizedWallet - Passed through to {@link handleVerifyPayment}.
+ * @throws {Error} If `name` is not a known tool.
+ */
 function dispatchTool(
   name: string,
   toolArgs: JsonValue,
@@ -137,6 +175,18 @@ function dispatchTool(
   throw new Error(`Unknown tool: ${name}`);
 }
 
+/**
+ * Process a single JSON-RPC 2.0 request object.
+ *
+ * Routes `initialize`, `notifications/initialized`, `tools/list`, and
+ * `tools/call`.  Returns `null` for `notifications/initialized` (no response
+ * — it is a notification); returns a response object for all other methods.
+ *
+ * @param req - Parsed JSON-RPC request object.
+ * @param authorizedWallet - Ethereum address for wallet-match checks, or
+ *   `null` for permissive mode.
+ * @returns JSON-RPC response object, or `null` for notifications.
+ */
 function handleMessage(
   req: JsonValue,
   authorizedWallet: string | null
